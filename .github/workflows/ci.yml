@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: CXX=${{ matrix.compiler }} cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build (warnings are errors)
+        run: cmake --build build -j
+      - name: Test
+        run: |
+          ./build/ratelimit_tests | tee tests.txt
+          echo "::notice title=Tests (${{ matrix.compiler }})::$(tail -1 tests.txt)"
+
+  sanitizers:
+    name: Sanitizers (${{ matrix.sanitize }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitize: ["address,undefined", "thread"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Allow ThreadSanitizer's memory layout
+        # Ubuntu 24.04 kernels use more ASLR entropy than TSan supports.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Build
+        run: |
+          CXX=g++ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DRATELIMIT_SANITIZE=${{ matrix.sanitize }}
+          cmake --build build -j --target ratelimit_tests
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: |
+          ./build/ratelimit_tests | tee tests.txt
+          echo "::notice title=Sanitizer ${{ matrix.sanitize }}::$(tail -1 tests.txt), no reports"
+
+  benchmark:
+    name: Benchmarks
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Redis
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-server redis-tools
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          echo "::notice title=Runner::$(nproc) CPUs, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs), $(redis-server --version | cut -d' ' -f3)"
+      - name: In-process limiter
+        run: |
+          ./build/bench_limiter 1.0 100000 | tee limiter.md
+          grep '^| [0-9]' limiter.md | head -9 | while read -r row; do echo "::notice title=bench_limiter::$row"; done
+      - name: Server vs Redis Lua (redis-benchmark)
+        env:
+          REQUESTS: "1000000"
+          WORKERS: "2"
+          BENCH_THREADS: "2"
+        run: |
+          bench/bench_server.sh | tee server.md
+          grep '^| [Rr]' server.md | grep -v Server | while read -r row; do echo "::notice title=bench_server::$row"; done
